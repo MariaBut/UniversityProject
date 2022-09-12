@@ -1,0 +1,392 @@
+---
+title: "University Post App"
+output: html_document
+---
+###Сбор данных###
+
+```{r}
+library(dplyr)
+library(stringr)
+library(jsonlite)
+install.packages("cli") 
+```
+
+```{r}
+data <- readr::read_csv("~/univpostsRAWdata.csv")
+data <- data[,-1]
+data$links <- factor(ifelse(grepl("link", data$attachments, fixed = T), 1, 0))
+data$photo <- factor(ifelse(grepl("photo", data$attachments, fixed = T), 1, 0))
+data <- dplyr::select(data, -attachments, -reposts.user_reposted, -likes.can_like)
+data <- dplyr::filter(data, !is.na(text))
+```
+
+```{r}
+groupInfo <- readLines("~/groupINFO.json") %>% 
+  str_c(collapse = ",") %>%  
+  (function(str) str_c("[", str, "]")) %>% 
+  fromJSON(simplifyDataFrame = T, flatten = T)
+
+groupInfo$owner_id <- -groupInfo$owner_id
+
+data <- dplyr::left_join(data, groupInfo, by = "owner_id")
+```
+
+###Построение модели###
+
+####Подгтовка датасета####
+```{r}
+data <- data[,-1]
+data$date <- as.POSIXct(data$date, origin="1970-01-01")
+data$smiles <- str_detect(data$text,"<") #если есть смайлы в посте, то будет TRUE
+```
+
+```{r}
+library(lubridate)
+data$date <- ymd_hms(data$date)
+data$hour <- hour(data$date)
+data$day <- day(data$date)
+data$weekday <- wday(data$date) #учитывать, что вс - это первый день!
+data$month <- month(data$date)
+data$year <- year(data$date)
+```
+
+```{r}
+data <- dplyr::filter(data, year >= 2017) #оставили только последних 1,5 года 
+#с 2017 года вк сделал публичным количество просмотров
+data$lengthPost <- str_length(data$text)#длина поста (в количестве знаков)
+data <- dplyr::filter(data, text != "")
+data$id_post <- c(1:nrow(data))
+```
+
+####Cоздаём независимые переменные####
+```{r}
+data$holiday <- factor(ifelse(data$weekday == "7" | data$weekday == "1", 1,0)) #если это сб или вс,то значение 1
+data$partday <- factor(ifelse(data$hour >= 18 & data$hour <= 23, "evening",
+                       ifelse(data$hour >= 0 & data$hour <= 7, "night",
+                              ifelse(data$hour >= 8 & data$hour <= 11, "morning",
+                                     ifelse(data$hour >= 12 & data$hour <= 17, "afternoon", "bug")))))
+```
+
+####Cоздаем зависимые переменные####
+```{r}
+data <- dplyr::mutate(data, successLikes = likes.count / numberFollowers)
+data$success <- factor(ifelse(data$successLikes >= mean(data$successLikes), 1, 0))
+```
+
+####Text cleaning####
+```{r}
+data$text <- gsub("http\\S+\\s*", "", data$text)# Get rid of URLs
+data$text = tolower(data$text)# Приводим все слова к нижнему регистру
+data$text = str_replace_all(data$text, "\\&quot\\;", " ")# Убирем то, что осталось от кавычек и апострофа
+data$text = str_replace_all(data$text, "\\&apos\\;", " ")
+data$text = str_replace_all(data$text, "[[:punct:]]", "")# Убирем всю пунктуацию
+data$text = str_replace_all(data$text, "[0-9]+", "")# И числа
+data$text <- qdapRegex::rm_white(data$text) #лишние пробелы
+```
+
+####Sentiment analysis####
+```{r}
+library(tidytext)
+data_tokens <- as.data.frame(dplyr::select(data, text, owner_id, id_post))
+data_tokens <- data_tokens %>%
+  unnest_tokens(word, text) # разбиваем на слова
+
+stp_wrds <- as.data.frame(tm::stopwords("russian"))
+colnames(stp_wrds) <- "word"
+data_tokens <- dplyr::anti_join(data_tokens,stp_wrds, by = "word")
+
+dicAffin <- read.csv("~/dictionary.csv", sep = ",", encoding = "UTF-8")
+dicAffin <- dicAffin %>% group_by(word) %>% summarise(score = mean(score))
+
+sent_affin <- left_join(data_tokens, dicAffin)
+sent_affin <- na.omit(sent_affin)
+sent_affin <- sent_affin %>% group_by(id_post) %>% summarise(sentiment = mean(score))
+
+data <- left_join(data, sent_affin, by = "id_post")
+for (row in 1:nrow(data)){
+  if (is.na(data$sentiment[row])){
+    data$sentiment[row] = 0
+  }
+}
+```
+
+####Наша предсказательная модель####  
+```{r}
+glmm <- glm(data = data, success~sentiment+lengthPost+holiday+partday+repostsmth+links+photo,
+            family = binomial(link = 'logit'))
+saveRDS(glmm, "glmm.rds")
+```
+
+###Загрузка модели###
+#####Чтобы наше приложение долго не запускалось, то сохраним нашу готовую логистическую модель отдельным файлом#####
+
+```{r}
+glmm <- readRDS("~/glmm.rds")
+
+library(shiny)
+library(shinyjs)
+library(shinyBS)
+library(tidytext)
+library(dplyr)
+```
+
+####Включает кнопку, если заполнены все поля####
+```{r}
+fieldsMandatory <- c("postInput", "weekday")
+
+getsent <- function(input){
+  data_tokens <- data.frame(text = input)
+  data_tokens$text <- as.character(data_tokens$text)
+  data_tokens <- data_tokens %>%
+    unnest_tokens(word, text) # разбиваем на слова
+  
+  stp_wrds <- as.data.frame(tm::stopwords("russian"))
+  colnames(stp_wrds) <- "word"
+  data_tokens <- dplyr::anti_join(data_tokens,stp_wrds, by = "word")
+  
+  dicAffin <- read.csv("~/dictionary.csv", sep = ",", encoding = "UTF-8")
+  dicAffin <- dicAffin %>% group_by(word) %>% summarise(score = mean(score))
+  
+  sent_affin <- left_join(data_tokens, dicAffin)
+  sent_affin <- na.omit(sent_affin)
+  
+  sent_affin <- sent_affin %>% group_by() %>% summarise(sentiment = sum(score))
+  sentiment = sent_affin$sentiment
+  sentiment
+}
+```
+
+####UI####
+```{r}
+ui <- fluidPage(
+  shinyjs::useShinyjs(),
+  titlePanel(title = "Потенциальная популярность публикации", windowTitle = "University Post App"),
+  sidebarPanel(width = 3,
+               textAreaInput(inputId = "postInput", value = "", label = "Текстовое наполнение публикации",
+                             width = '100%', height = "200px",
+                             placeholder = "Введите сюда текст потенциальной публикации",
+                             resize = "both"),
+               selectInput(inputId = "weekday", label = "День недели во время публикации",
+                           choices = c("Понедельник" = 2,
+                                       "Вторник" = 3,
+                                       "Среда" = 4,
+                                       "Четверг" = 5,
+                                       "Пятница" = 6,
+                                       "Суббота" = 7,
+                                       "Воскресенье" = 1)),
+               numericInput(inputId = "time", label = "Час публикации\n(24-часовой формат)",
+                            value = 18, min = 0, max = 23, step = 1),
+               checkboxGroupInput(inputId = "attachments", "Будут ли прикреплены ссылки или репост?",
+                                  choiceNames =
+                                    list(icon("globe"), icon("retweet"), icon("photo")),
+                                  choiceValues =
+                                    list("links", "repost", "photo")),
+               actionButton(inputId = "submit", label = "Узнать результат", 
+                            icon = icon("paper-plane"), 
+                            class = "btn-primary")
+  ),
+  mainPanel(
+    h3(textOutput("headlength")),
+    h4(textOutput("lengthpost")),
+    h3(textOutput("Sentimenthead")),
+    h4(textOutput("Sentiment")),
+    h6(textOutput("Sentimentexplain")),
+    h6(textOutput("Sentimentfeedback")),
+    tableOutput("Sentimentword"),
+    h3(textOutput("headprobability")),
+    h4(textOutput("probability")),
+    div(style = "position:fixed;right:15px; bottom: 15px;",
+        actionButton("projectInfo", "Описание проекта", icon = icon("pencil"), class = "btn-primary"),    
+        actionButton("glmmInfo", "Показать регрессионную модель", icon = icon("signal"), class = "btn-primary"),
+        actionButton("contacts", "Информация о разработчкиках", icon = icon("user"), class = "btn-primary")),
+    tags$style(type='text/css', '#regr {background-color: white;}'),
+    bsModal("projectdesc",
+            "О проекте",
+            "projectInfo",
+            size = "medium",
+            h5("Цель данного проекта: создать приложение, определяющее успешность публикаций публичных страниц университетов на примере социальной сети ВК"),
+            h5("Для определения успешность были спарсины данные 20 страниц крупнейших вузов"),
+            h5("После обработки сырых данных были созданы фичи, описанные в разделе 'Наша регрессионная модель'"),
+            h5("Зависимой переменной стало количество лайков за пост, поделенной на количество подписчиков (для уравновешивания в значимости различные по объему паблики)"),
+            h5("Данные взяты с января 2017 года")),
+    bsModal("modalExample",
+            "Наша регрессионная модель",
+            "glmmInfo",
+            size = "large",
+            verbatimTextOutput("regr"), 
+            h5("sentiment - эмоциональный окрас публикации"), 
+            h5("lengthPost - длина публикации в символах"),
+            h5("holiday - день недели публикации (1 - если это выходной, 0 - будний)"),
+            h5("partdayevening - вечер/утро/ночь (базовая характеристика - полдень)"),
+            h5("repostsmth - является ли публикация репостом с дополнительным описанием (1 - да, 0 - нет)"),
+            h5("links - наличие ссылок на сторонник источники (1 - да, 0 - нет)"),
+            h5("photo - прикреплена ли картинка к публикации (1 - да, 0 - нет)")),
+    bsModal("modal2",
+            "Информация о разработчиках",
+            "contacts",
+            size = "large",
+            h4("Ковалёва Мария"),
+            h5('НИУ "Высшая школа экономики". Студентка ОП "Менеджент", 3 курс'),
+            h5(' ⁣ ⁣  '),
+            h4("Точилова Людмила"),
+            h5('НИУ "Высшая школа экономики". Студентка ОП "Менеджент", 3 курс'))
+))
+```
+
+###Server###
+```{r}
+server <- function(input, output) {
+  
+  
+####Включает кнопку, если заполнены все поля####
+  observe({
+    # check if all mandatory fields have a value
+    mandatoryFilled <-
+      vapply(fieldsMandatory,
+             function(x) {
+               !is.null(input[[x]]) && input[[x]] != ""
+             },
+             logical(1))
+    mandatoryFilled <- all(mandatoryFilled)
+    
+    # enable/disable the submit button
+    if (!mandatoryFilled){
+      shinyjs::disable("submit") 
+    } else {
+      shinyjs::enable("submit")
+    }
+  })
+####Конец про вкл/выкл кнопки####  
+  
+####Про количество символов в публикации####  
+  output$headlength <- renderText({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    print("Длина текста данной публикации в символах:")
+  })
+  
+  output$lengthpost <- renderText({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    isolate(stringr::str_length(input$postInput))
+  })
+  
+####Эмоциональный окрас отзыва####   
+  output$Sentimenthead <- renderText({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    print("Данная публикация имеет следующий эмоциональный окрас:")
+  })
+  
+  output$Sentiment <- renderText({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    isolate(getsent(input$postInput))
+  })
+  
+  output$Sentimentexplain <- renderText({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    print("Примечание: отрицательное значение - пост имеет негативный оттенок, положительное - позитивный оттенок, нулевое - нейтральный")
+  })
+  
+  output$Sentimentfeedback <- renderText({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    if (getsent(isolate(input$postInput)) == 0){
+      return()
+    }
+    if (getsent(isolate(input$postInput)) < 0){
+      print("Данный пост имеет отрицательный окрас из-за следующих слов:")
+    }
+  })
+  
+  output$Sentimentword <- renderTable({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    if (getsent(isolate(input$postInput)) == 0){
+      return()
+    }
+    if (getsent(isolate(input$postInput)) < 0){
+      data_tokens <- data.frame(text = isolate(input$postInput))
+      data_tokens$text <- as.character(data_tokens$text)
+      data_tokens <- data_tokens %>%
+        unnest_tokens(word, text) # разбиваем на слова
+      
+      stp_wrds <- as.data.frame(tm::stopwords("russian"))
+      colnames(stp_wrds) <- "word"
+      data_tokens <- dplyr::anti_join(data_tokens,stp_wrds, by = "word")
+      
+dicAffin <- read.csv("~/dictionary.csv", sep = ",", encoding = "UTF-8")
+  dicAffin <- dicAffin %>% group_by(word) %>% summarise(score = mean(score))
+      
+      sent_affin <- left_join(data_tokens, dicAffin)
+      sent_affin <- na.omit(sent_affin)
+      dplyr::filter(sent_affin,score < 0)
+    }
+  })
+  
+####Про вероятность успешности####      
+  output$headprobability <- renderText({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    print("Вероятность, что данный пост будет успешен:")
+  })
+####Создаём датасет для предсказания####    
+  output$probability <- renderText({
+    input$submit
+    if (input$submit == 0){
+      return()
+    }
+    
+    repostsmth <- ifelse(grepl("repost", isolate(input$attachments[1]), fixed = T), 1, 0)
+    links <- ifelse(grepl("links", isolate(input$attachments[1]), fixed = T), 1, 0)
+    photo <- ifelse(grepl("photo", isolate(input$attachments[1]), fixed = T), 1, 0)
+    
+    holiday <- ifelse(isolate(input$weekday) == "1" | isolate(input$weekday) == "7", 1,0)
+    partday <- ifelse(isolate(input$time) >= 18 & isolate(input$time) <= 23, "evening",
+                      ifelse(isolate(input$time) >= 0 & isolate(input$time) <= 7, "night",
+                             ifelse(isolate(input$time) >= 8 & isolate(input$time) <= 11, "morning",
+                                    ifelse(isolate(input$time) >= 12 & isolate(input$time) <= 17, "afternoon", "bug"))))
+    textpost <- isolate(input$postInput)
+    lengthPost <- stringr::str_length(textpost)
+    
+    sentiment = isolate(getsent(input$postInput))
+    
+    if (length(input$attachments[1]) == 0){
+      repostsmth = 0
+      links = 0
+      photo = 0
+    }
+    
+    data = data.frame(sentiment, lengthPost, partday, holiday, links, repostsmth, photo)
+    data$holiday <- as.factor(data$holiday)
+    data$links <- as.factor(data$links)
+    data$photo <- as.factor(data$photo)
+    prob = predict(glmm, data, type = "response")
+  })
+  
+####Описание нашей модели    
+  output$regr <- renderPrint({
+    summary(glmm)
+  })
+}
+# Run the application 
+shinyApp(ui = ui, server = server)
+```
